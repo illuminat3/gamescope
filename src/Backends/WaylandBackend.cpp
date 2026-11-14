@@ -2858,6 +2858,10 @@ namespace gamescope
         }
         m_pSelectionOffer = pOffer;
 
+        for ( PendingClipboardRead &read : m_PendingClipboardReads )
+            close( read.nFd );
+        m_PendingClipboardReads.clear();
+
         if ( !pOffer )
             return;
 
