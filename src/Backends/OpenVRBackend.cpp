@@ -1182,7 +1182,10 @@ namespace gamescope
 
             wlserver_lock();
             if ( uButton == BTN_LEFT )
+            {
                 wlserver_touchup( 0, ++m_uFakeTimestamp );
+                wlserver_touchframe();
+            }
             else
                 wlserver_mousebutton( uButton, false, ++m_uFakeTimestamp );
             wlserver_unlock();
@@ -1481,6 +1484,7 @@ namespace gamescope
                                         wlserver_touchdown(flX, flY, 0, ++m_uFakeTimestamp);
                                     else
                                         wlserver_touchup(0, ++m_uFakeTimestamp);
+                                    wlserver_touchframe();
                                 }
                                 else if (vrEvent.data.mouse.button == vr::VRMouseButton_Right)
                                 {
@@ -1539,6 +1543,7 @@ namespace gamescope
 
                 wlserver_lock();
                 wlserver_touchmotion(flTouchMoveX, flTouchMoveY, 0, ++m_uFakeTimestamp, bAlwaysMoveCursor);
+                wlserver_touchframe();
                 wlserver_unlock();
             }
         }
@@ -1742,10 +1747,11 @@ namespace gamescope
             vHotspot.v[ 1 ] = static_cast< float >( pCursorInfo->uYHotspot ) / pCursorInfo->uHeight;
             vr::VROverlay()->SetOverlayTransformCursor( m_CursorPlane.GetOverlay(), &vHotspot );
 
+            // The layer is placed by its top-left corner, add the hotspot back to get the pointer.
             vr::HmdVector2_t vMousePos =
             {
-                static_cast<float>( -pCursorLayer->offset.x ),
-                static_cast<float>( static_cast<float>( g_nOutputHeight ) + pCursorLayer->offset.y ),
+                static_cast<float>( -pCursorLayer->offset.x + pCursorInfo->uXHotspot / pCursorLayer->scale.x ),
+                static_cast<float>( static_cast<float>( g_nOutputHeight ) + pCursorLayer->offset.y - pCursorInfo->uYHotspot / pCursorLayer->scale.y ),
             };
 
             FrameInfo_t::Layer_t textureLayer = *pCursorLayer;

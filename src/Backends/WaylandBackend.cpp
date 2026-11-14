@@ -617,6 +617,7 @@ namespace gamescope
         void Wayland_Touch_Down( wl_touch *pTouch, uint32_t uSerial, uint32_t uTime, wl_surface *pSurface, int32_t nId, wl_fixed_t fX, wl_fixed_t fY );
         void Wayland_Touch_Up( wl_touch *pTouch, uint32_t uSerial, uint32_t uTime, int32_t nId );
         void Wayland_Touch_Motion( wl_touch *pTouch, uint32_t uTime, int32_t nId, wl_fixed_t fX, wl_fixed_t fY );
+        void Wayland_Touch_Frame( wl_touch *pTouch );
         void Wayland_Touch_Cancel( wl_touch *pTouch );
         static const wl_touch_listener s_TouchListener;
     };
@@ -661,7 +662,7 @@ namespace gamescope
         .down        = WAYLAND_USERDATA_TO_THIS( CWaylandInputThread, Wayland_Touch_Down ),
         .up          = WAYLAND_USERDATA_TO_THIS( CWaylandInputThread, Wayland_Touch_Up ),
         .motion      = WAYLAND_USERDATA_TO_THIS( CWaylandInputThread, Wayland_Touch_Motion ),
-        .frame       = WAYLAND_NULL(),
+        .frame       = WAYLAND_USERDATA_TO_THIS( CWaylandInputThread, Wayland_Touch_Frame ),
         .cancel      = WAYLAND_USERDATA_TO_THIS( CWaylandInputThread, Wayland_Touch_Cancel ),
         .shape       = WAYLAND_NULL(),
         .orientation = WAYLAND_NULL(),
@@ -1574,15 +1575,15 @@ namespace gamescope
                             const hdr_metadata_infoframe *pInfoframe = &m_ColorState->pHDRMetadata->View<hdr_output_metadata>().hdmi_metadata_type1;
 
                             wp_image_description_creator_params_v1_set_mastering_display_primaries( pParams,
-                                // Rescale...
-                                (((int32_t)pInfoframe->display_primaries[0].x) * 1'000'000) / 0xC350,
-                                (((int32_t)pInfoframe->display_primaries[0].y) * 1'000'000) / 0xC350,
-                                (((int32_t)pInfoframe->display_primaries[1].x) * 1'000'000) / 0xC350,
-                                (((int32_t)pInfoframe->display_primaries[1].y) * 1'000'000) / 0xC350,
-                                (((int32_t)pInfoframe->display_primaries[2].x) * 1'000'000) / 0xC350,
-                                (((int32_t)pInfoframe->display_primaries[2].y) * 1'000'000) / 0xC350,
-                                (((int32_t)pInfoframe->white_point.x) * 1'000'000) / 0xC350,
-                                (((int32_t)pInfoframe->white_point.y) * 1'000'000) / 0xC350);
+                                // Infoframe chromaticities are in 1/50000 units, the protocol wants 1/1000000.
+                                pInfoframe->display_primaries[0].x * 20,
+                                pInfoframe->display_primaries[0].y * 20,
+                                pInfoframe->display_primaries[1].x * 20,
+                                pInfoframe->display_primaries[1].y * 20,
+                                pInfoframe->display_primaries[2].x * 20,
+                                pInfoframe->display_primaries[2].y * 20,
+                                pInfoframe->white_point.x * 20,
+                                pInfoframe->white_point.y * 20);
 
                             wp_image_description_creator_params_v1_set_mastering_luminance( pParams,
                                 pInfoframe->min_display_mastering_luminance,
@@ -3342,6 +3343,7 @@ namespace gamescope
 
         wlserver_lock();
         wlserver_touchmotion( flX, flY, 0, ++m_uFakeTimestamp );
+        wlserver_touchframe();
         wlserver_unlock();
     }
     void CWaylandInputThread::Wayland_Pointer_Button( wl_pointer *pPointer, uint32_t uSerial, uint32_t uTime, uint32_t uButton, uint32_t uState )
@@ -3566,11 +3568,18 @@ namespace gamescope
         wlserver_touchmotion( flX, flY, nId, ++m_uFakeTimestamp );
         wlserver_unlock();
     }
+    void CWaylandInputThread::Wayland_Touch_Frame( wl_touch *pTouch )
+    {
+        wlserver_lock();
+        wlserver_touchframe();
+        wlserver_unlock();
+    }
     void CWaylandInputThread::Wayland_Touch_Cancel( wl_touch *pTouch )
     {
         wlserver_lock();
         for ( auto &[ nId, state ] : m_TouchPlaneStates )
             wlserver_touchup( nId, ++m_uFakeTimestamp );
+        wlserver_touchframe();
         wlserver_unlock();
 
         m_TouchPlaneStates.clear();

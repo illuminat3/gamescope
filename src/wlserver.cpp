@@ -46,6 +46,7 @@
 #include <wlr/types/wlr_pointer_constraints_v1.h>
 #include <wlr/types/wlr_layer_shell_v1.h>
 #include <wlr/types/wlr_data_device.h>
+#include <wlr/types/wlr_subcompositor.h>
 #include <wlr/util/region.h>
 #include "wlr_end.hpp"
 
@@ -166,6 +167,8 @@ ResListEntry_t PrepareCommit( struct wlr_surface *surf, struct wlr_buffer *buf )
 		}
 	}
 
+	wl_surf->pLastAcquirePoint = pAcquirePoint;
+
 	ResListEntry_t newEntry = ResListEntry_t {
 		surf,
 		buf,
@@ -246,6 +249,13 @@ void xwayland_surface_commit(struct wlr_surface *wlr_surface) {
 	// Mutter and Weston have forward progress on the frame callback in this situation,
 	// so let the commit go through. It will be duplication-eliminated later.
 
+	// Popups must be configured before they are mapped, which wlroots doesn't do.
+	if ( struct wlr_xdg_surface *xdg_surface = wlr_xdg_surface_try_from_wlr_surface( wlr_surface ) )
+	{
+		if ( xdg_surface->initial_commit && xdg_surface->role != WLR_XDG_SURFACE_ROLE_TOPLEVEL )
+			wlr_xdg_surface_schedule_configure( xdg_surface );
+	}
+
 	VulkanWlrTexture_t *tex = (VulkanWlrTexture_t *) wlr_surface_get_texture( wlr_surface );
 	if ( tex == NULL )
 	{
@@ -266,6 +276,17 @@ void xwayland_surface_commit(struct wlr_surface *wlr_surface) {
 	else if (wlserver_xdg_surface_info)
 	{
 		wlserver_xdg_commit( std::move( entry ) );
+	}
+	else if ( wlr_subsurface_try_from_wlr_surface( wlr_surface ) ||
+	          wlr_xdg_surface_try_from_wlr_surface( wlr_surface ) )
+	{
+		// Popups and subsurfaces need to import their buffer before the surface tree
+		// can be painted. Save the commit in the queue for doing this later.
+		{
+			std::lock_guard<std::mutex> lock( wlserver.non_toplevel_commit_lock );
+			wlserver.non_toplevel_commit_queue.push_back( std::move( entry ) );
+		}
+		nudge_steamcompmgr();
 	}
 	else
 	{
@@ -494,6 +515,11 @@ static void wlserver_handle_touch_motion(struct wl_listener *listener, void *dat
 	wlserver_touchmotion( event->x, event->y, event->touch_id, event->time_msec, false, touch->connector );
 }
 
+static void wlserver_handle_touch_frame(struct wl_listener *listener, void *data)
+{
+	wlserver_touchframe();
+}
+
 struct wlserver_keyboard {
 	struct wlr_keyboard *wlr;
 
@@ -532,6 +558,7 @@ static void wlserver_handle_touch_destroy(struct wl_listener *listener, void *da
 	wl_list_remove( &touch->down.link );
 	wl_list_remove( &touch->up.link );
 	wl_list_remove( &touch->motion.link );
+	wl_list_remove( &touch->frame.link );
 	wl_list_remove( &touch->destroy.link );
 	free( touch );
 }
@@ -597,6 +624,8 @@ static void wlserver_new_input(struct wl_listener *listener, void *data)
 			wl_signal_add( &touch->wlr->events.up, &touch->up );
 			touch->motion.notify = wlserver_handle_touch_motion;
 			wl_signal_add( &touch->wlr->events.motion, &touch->motion );
+			touch->frame.notify = wlserver_handle_touch_frame;
+			wl_signal_add( &touch->wlr->events.frame, &touch->frame );
 			touch->destroy.notify = wlserver_handle_touch_destroy;
 			wl_signal_add( &device->events.destroy, &touch->destroy);
 
@@ -663,6 +692,39 @@ static void handle_wl_surface_destroy( struct wl_listener *l, void *data )
 	{
 		wlserver_xdg_surface_info_finish( surf->xdg_surface );
 		surf->xdg_surface = nullptr;
+	}
+
+	std::vector<ResListEntry_t> discarded_commits;
+	{
+		std::lock_guard<std::mutex> lock( wlserver.non_toplevel_commit_lock );
+		std::erase_if( wlserver.non_toplevel_commit_queue,
+			[surf = surf->wlr, &discarded_commits]( auto &entry ) {
+				if ( entry.surf != surf )
+					return false;
+				discarded_commits.push_back( std::move( entry ) );
+				return true;
+			} );
+	}
+	for ( auto &entry : discarded_commits )
+	{
+		wlserver_presentation_feedback_discard( entry.presentation_feedbacks );
+		if ( entry.buf )
+			wlr_buffer_unlock( entry.buf );
+	}
+
+	{
+		std::vector<NonToplevelCommit_t> &deferred = wlserver_non_toplevel_deferred_commits();
+		for ( auto it = deferred.begin(); it != deferred.end(); )
+		{
+			if ( it->surf != surf->wlr )
+			{
+				++it;
+				continue;
+			}
+
+			wlserver_presentation_feedback_discard( it->presentation_feedbacks );
+			it = deferred.erase( it );
+		}
 	}
 
 	if ( surf->wlr == wlserver.mouse_focus_surface )
@@ -1304,18 +1366,16 @@ static void gamescope_control_take_screenshot( struct wl_client *client, struct 
 	} );
 }
 
-void drm_sleep_screen( gamescope::GamescopeScreenType eType, bool bSleep );
-
 static void gamescope_control_display_sleep( struct wl_client *client, struct wl_resource *resource, uint32_t display_type_flags, uint32_t flags )
 {
 	if ( flags & ( GAMESCOPE_CONTROL_DISPLAY_SLEEP_FLAGS_SLEEP | GAMESCOPE_CONTROL_DISPLAY_SLEEP_FLAGS_WAKE ) )
 	{
 		const bool sleep = !!( flags & GAMESCOPE_CONTROL_DISPLAY_SLEEP_FLAGS_SLEEP );
 		if ( display_type_flags & GAMESCOPE_CONTROL_DISPLAY_TYPE_FLAGS_EXTERNAL_DISPLAY )
-			drm_sleep_screen( gamescope::GAMESCOPE_SCREEN_TYPE_EXTERNAL, sleep );
+			GetBackend()->SleepScreen( gamescope::GAMESCOPE_SCREEN_TYPE_EXTERNAL, sleep );
 
 		if ( display_type_flags & GAMESCOPE_CONTROL_DISPLAY_TYPE_FLAGS_INTERNAL_DISPLAY )
-			drm_sleep_screen( gamescope::GAMESCOPE_SCREEN_TYPE_INTERNAL, sleep );
+			GetBackend()->SleepScreen( gamescope::GAMESCOPE_SCREEN_TYPE_INTERNAL, sleep );
 	}
 }
 
@@ -2091,10 +2151,6 @@ static void waylandy_surface_destroy(struct wl_listener *listener, void *data) {
 		wlserver_surface->xdg_surface = nullptr;
 }
 
-void xdg_toplevel_new(struct wl_listener *listener, void *data)
-{
-}
-
 wlserver_xdg_surface_info* waylandy_type_surface_new(struct wl_client *client, struct wlr_surface *surface)
 {
 	wlserver_wl_surface_info *wlserver_surface = get_wl_surface_info(surface);
@@ -2153,11 +2209,15 @@ wlserver_xdg_surface_info* waylandy_type_surface_new(struct wl_client *client, s
 	return xdg_surface_info;
 }
 
-void xdg_surface_new(struct wl_listener *listener, void *data)
+void xdg_toplevel_new(struct wl_listener *listener, void *data)
 {
-	struct wlr_xdg_surface *xdg_surface = (struct wlr_xdg_surface *)data;
+	struct wlr_xdg_toplevel *toplevel = (struct wlr_xdg_toplevel *)data;
+	struct wlr_xdg_surface *xdg_surface = toplevel->base;
 
 	wlserver_xdg_surface_info *surface_info = waylandy_type_surface_new(xdg_surface->client->client, xdg_surface->surface);
+	if (!surface_info)
+		return;
+
 	surface_info->destroy.notify = waylandy_surface_destroy;
 	wl_signal_add(&xdg_surface->events.destroy, &surface_info->destroy);
 
@@ -2170,6 +2230,9 @@ void layer_shell_surface_new(struct wl_listener *listener, void *data)
 	struct wlr_layer_surface_v1 *layer_surface = (struct wlr_layer_surface_v1 *)data;
 
 	wlserver_xdg_surface_info *surface_info = waylandy_type_surface_new(nullptr, layer_surface->surface);
+	if (!surface_info)
+		return;
+
 	surface_info->destroy.notify = waylandy_surface_destroy;
 	wl_signal_add(&layer_surface->events.destroy, &surface_info->destroy);
 
@@ -2310,6 +2373,12 @@ bool wlserver_init( void ) {
 
 	wl_signal_add( &wlserver.wlr.compositor->events.new_surface, &new_surface_listener );
 
+	if ( !wlr_subcompositor_create( wlserver.display ) )
+	{
+		wl_log.errorf( "Unable to create subcompositor interface" );
+		return false;
+	}
+
 	create_ime_manager( &wlserver );
 
 	create_reshade();
@@ -2365,9 +2434,7 @@ bool wlserver_init( void ) {
 		wl_log.infof("Unable to create XDG shell interface");
 		return false;
 	}
-	wlserver.new_xdg_surface.notify = xdg_surface_new;
 	wlserver.new_xdg_toplevel.notify = xdg_toplevel_new;
-	wl_signal_add(&wlserver.xdg_shell->events.new_surface, &wlserver.new_xdg_surface);
 	wl_signal_add(&wlserver.xdg_shell->events.new_toplevel, &wlserver.new_xdg_toplevel);
 
 	wlserver.layer_shell_v1 = wlr_layer_shell_v1_create(wlserver.display, 4);
@@ -2570,6 +2637,17 @@ void wlserver_run(void)
 	}
 
 	{
+		std::unique_lock lock4(wlserver.non_toplevel_commit_lock);
+		for ( auto &entry : wlserver.non_toplevel_commit_queue )
+		{
+			wlserver_presentation_feedback_discard( entry.presentation_feedbacks );
+			if ( entry.buf )
+				wlr_buffer_unlock( entry.buf );
+		}
+		wlserver.non_toplevel_commit_queue.clear();
+	}
+
+	{
 		std::unique_lock lock2(g_wlserver_xdg_shell_windows_lock);
 		wlserver.xdg_wins.clear();
 	}
@@ -2585,10 +2663,16 @@ void wlserver_run(void)
 	wlserver_lock();
 	wlserver.wlr.xwayland_servers.clear();
 
+	{
+		std::vector<NonToplevelCommit_t> &deferred = wlserver_non_toplevel_deferred_commits();
+		for ( auto &entry : deferred )
+			wlserver_presentation_feedback_discard( entry.presentation_feedbacks );
+		deferred.clear();
+	}
+
 	wl_list_remove( &new_surface_listener.link );
 	wl_list_remove( &new_input_listener.link );
 	wl_list_remove( &wlserver.new_pointer_constraint.link );
-	wl_list_remove( &wlserver.new_xdg_surface.link );
 	wl_list_remove( &wlserver.new_xdg_toplevel.link );
 	wl_list_remove( &wlserver.new_layer_shell_surface.link );
 
@@ -3508,6 +3592,14 @@ void wlserver_touchup( int touch_id, uint32_t time )
 	bump_input_counter();
 }
 
+// Ends a group of touch events. Clients may not act on them until this is sent.
+void wlserver_touchframe()
+{
+	assert( wlserver_is_lock_held() );
+
+	wlr_seat_touch_notify_frame( wlserver.wlr.seat );
+}
+
 gamescope_xwayland_server_t *wlserver_get_xwayland_server( size_t index )
 {
 	if (index >= wlserver.wlr.xwayland_servers.size() )
@@ -3735,6 +3827,23 @@ std::vector<ResListEntry_t> wlserver_xdg_commit_queue()
 		commits = std::move(wlserver.xdg_commit_queue);
 	}
 	return commits;
+}
+
+std::vector<ResListEntry_t> wlserver_non_toplevel_commit_queue()
+{
+	std::vector<ResListEntry_t> commits;
+	{
+		std::lock_guard<std::mutex> lock( wlserver.non_toplevel_commit_lock );
+		commits = std::move(wlserver.non_toplevel_commit_queue);
+	}
+	return commits;
+}
+
+std::vector<NonToplevelCommit_t> &wlserver_non_toplevel_deferred_commits()
+{
+	assert( wlserver_is_lock_held() );
+
+	return wlserver.non_toplevel_deferred_commits;
 }
 
 uint32_t wlserver_make_new_xwayland_server()

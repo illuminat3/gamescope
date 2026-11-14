@@ -53,6 +53,18 @@ struct ResListEntry_t {
 	std::vector<pixman_box32_t> damage;
 };
 
+// A commit for a surface that is not a toplevel. These are composited as part
+// of their parent's surface tree.
+struct NonToplevelCommit_t
+{
+	struct wlr_surface *surf;
+	std::shared_ptr<struct wlr_buffer> buf;
+	struct wlr_surface *root;
+	uint64_t sequence;
+	std::vector<wlserver_presentation_feedback_ref> presentation_feedbacks;
+	std::shared_ptr<gamescope::CReleaseTimelinePoint> pReleasePoint;
+};
+
 struct wlserver_content_override;
 
 bool wlserver_is_lock_held(void);
@@ -201,7 +213,6 @@ struct wlserver_t {
 	struct wlr_layer_shell_v1 *layer_shell_v1;
 	struct wlr_relative_pointer_manager_v1 *relative_pointer_manager;
 	struct wlr_pointer_constraints_v1 *constraints;
-	struct wl_listener new_xdg_surface;
 	struct wl_listener new_xdg_toplevel;
 	struct wl_listener new_layer_shell_surface;
 	struct wl_listener new_pointer_constraint;
@@ -209,6 +220,10 @@ struct wlserver_t {
 	std::atomic<bool> xdg_dirty;
 	std::mutex xdg_commit_lock;
 	std::vector<ResListEntry_t> xdg_commit_queue;
+
+	std::mutex non_toplevel_commit_lock;
+	std::vector<ResListEntry_t> non_toplevel_commit_queue;
+	std::vector<NonToplevelCommit_t> non_toplevel_deferred_commits;
 
 	std::vector<wl_resource*> gamescope_controls;
 	std::unordered_map< uint32_t, std::vector<wl_resource*> > app_perf_requests;
@@ -227,6 +242,8 @@ struct wlserver_t {
 extern struct wlserver_t wlserver;
 
 std::vector<ResListEntry_t> wlserver_xdg_commit_queue();
+std::vector<ResListEntry_t> wlserver_non_toplevel_commit_queue();
+std::vector<NonToplevelCommit_t> &wlserver_non_toplevel_deferred_commits();
 
 struct wlserver_pointer {
 	struct wlr_pointer *wlr;
@@ -244,6 +261,7 @@ struct wlserver_touch {
 	struct wl_listener down;
 	struct wl_listener up;
 	struct wl_listener motion;
+	struct wl_listener frame;
 	struct wl_listener destroy;
 
     gamescope::IBackendConnector* connector;
@@ -283,6 +301,7 @@ void wlserver_drag_anchor_move( struct wlr_surface *surface, int x, int y, int b
 void wlserver_touchmotion( double x, double y, int touch_id, uint32_t time, bool bAlwaysWarpCursor = false, gamescope::IBackendConnector* connector = nullptr );
 void wlserver_touchdown( double x, double y, int touch_id, uint32_t time, gamescope::IBackendConnector* connector = nullptr );
 void wlserver_touchup( int touch_id, uint32_t time );
+void wlserver_touchframe();
 
 void wlserver_send_frame_done( struct wlr_surface *surf, const struct timespec *when );
 
