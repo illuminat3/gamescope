@@ -17,6 +17,8 @@
 #include <csignal>
 #include <sys/mman.h>
 #include <poll.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <linux/input-event-codes.h>
 #include <xkbcommon/xkbcommon.h>
 #include <libdecor.h>
@@ -804,6 +806,15 @@ namespace gamescope
         void Wayland_DataSource_Cancelled( struct wl_data_source *pSource );
         static const wl_data_source_listener s_DataSourceListener;
 
+        // Host -> nested clipboard (paste into the game)
+        void Wayland_DataDevice_DataOffer( wl_data_device *pDevice, wl_data_offer *pOffer );
+        void Wayland_DataDevice_Selection( wl_data_device *pDevice, wl_data_offer *pOffer );
+        static const wl_data_device_listener s_DataDeviceListener;
+        void Wayland_DataOffer_Offer( wl_data_offer *pOffer, const char *pMime );
+        static const wl_data_offer_listener s_DataOfferListener;
+        void EnsureDataDevice();
+        void PollClipboardReads();
+
         void Wayland_PrimarySelectionSource_Send( struct zwp_primary_selection_source_v1 *pSource, const char *pMime, int nFd );
         void Wayland_PrimarySelectionSource_Cancelled( struct zwp_primary_selection_source_v1 *pSource );
         static const zwp_primary_selection_source_v1_listener s_PrimarySelectionSourceListener;
@@ -838,6 +849,10 @@ namespace gamescope
         wl_data_device_manager *m_pDataDeviceManager = nullptr;
         wl_data_device *m_pDataDevice = nullptr;
         std::shared_ptr<std::string> m_pClipboard = nullptr;
+        std::unordered_map<wl_data_offer *, std::vector<std::string>> m_DataOfferMimes;
+        wl_data_offer *m_pSelectionOffer = nullptr;
+        struct PendingClipboardRead { int nFd; std::string szData; };
+        std::vector<PendingClipboardRead> m_PendingClipboardReads;
 
         zwp_primary_selection_device_manager_v1 *m_pPrimarySelectionDeviceManager = nullptr;
         zwp_primary_selection_device_v1 *m_pPrimarySelectionDevice = nullptr;
@@ -943,6 +958,21 @@ namespace gamescope
         .dnd_drop_performed = WAYLAND_NULL(),
         .dnd_finished       = WAYLAND_NULL(),
         .action             = WAYLAND_NULL(),
+    };
+    const wl_data_device_listener CWaylandBackend::s_DataDeviceListener =
+    {
+        .data_offer = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_DataDevice_DataOffer ),
+        .enter      = WAYLAND_NULL(),
+        .leave      = WAYLAND_NULL(),
+        .motion     = WAYLAND_NULL(),
+        .drop       = WAYLAND_NULL(),
+        .selection  = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_DataDevice_Selection ),
+    };
+    const wl_data_offer_listener CWaylandBackend::s_DataOfferListener =
+    {
+        .offer          = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_DataOffer_Offer ),
+        .source_actions = WAYLAND_NULL(),
+        .action         = WAYLAND_NULL(),
     };
     const zwp_primary_selection_source_v1_listener CWaylandBackend::s_PrimarySelectionSourceListener =
     {
@@ -1333,8 +1363,7 @@ namespace gamescope
 
     void CWaylandConnector::SetSelection( std::shared_ptr<std::string> szContents, GamescopeSelection eSelection )
     {
-        if ( m_pBackend->m_pDataDeviceManager && !m_pBackend->m_pDataDevice )
-            m_pBackend->m_pDataDevice = wl_data_device_manager_get_data_device( m_pBackend->m_pDataDeviceManager, m_pBackend->m_pSeat );
+        m_pBackend->EnsureDataDevice();
 
         if ( m_pBackend->m_pPrimarySelectionDeviceManager && !m_pBackend->m_pPrimarySelectionDevice )
             m_pBackend->m_pPrimarySelectionDevice = zwp_primary_selection_device_manager_v1_get_device( m_pBackend->m_pPrimarySelectionDeviceManager, m_pBackend->m_pSeat );
@@ -1349,6 +1378,7 @@ namespace gamescope
             wl_data_source_offer( source, "TEXT" );
             wl_data_source_offer( source, "STRING" );
             wl_data_source_offer( source, "UTF8_STRING" );
+            wl_data_source_offer( source, "application/x-gamescope-selection" );
             wl_data_device_set_selection( m_pBackend->m_pDataDevice, source, m_pBackend->m_uKeyboardEnterSerial );
         }
         else if ( eSelection == GAMESCOPE_SELECTION_PRIMARY && m_pBackend->m_pPrimarySelectionDevice )
@@ -2151,6 +2181,8 @@ namespace gamescope
 
     bool CWaylandBackend::PostInit()
     {
+        EnsureDataDevice();
+
         if ( m_pSinglePixelBufferManager )
         {
             wl_buffer *pBlackBuffer = wp_single_pixel_buffer_manager_v1_create_u32_rgba_buffer( m_pSinglePixelBufferManager, 0, 0, 0, ~0u );
@@ -2260,6 +2292,8 @@ namespace gamescope
         }
 
         wl_display_dispatch_pending( m_pDisplay );
+
+        PollClipboardReads();
 
         return false;
     }
@@ -2791,6 +2825,99 @@ namespace gamescope
     void CWaylandBackend::Wayland_DataSource_Cancelled( struct wl_data_source *pSource )
     {
         wl_data_source_destroy( pSource );
+    }
+
+    // Data Device (host clipboard -> nested X clipboard)
+
+    void CWaylandBackend::EnsureDataDevice()
+    {
+        if ( m_pDataDevice || !m_pDataDeviceManager || !m_pSeat )
+            return;
+
+        m_pDataDevice = wl_data_device_manager_get_data_device( m_pDataDeviceManager, m_pSeat );
+        wl_data_device_add_listener( m_pDataDevice, &s_DataDeviceListener, this );
+    }
+
+    void CWaylandBackend::Wayland_DataDevice_DataOffer( wl_data_device *pDevice, wl_data_offer *pOffer )
+    {
+        m_DataOfferMimes[ pOffer ] = {};
+        wl_data_offer_add_listener( pOffer, &s_DataOfferListener, this );
+    }
+
+    void CWaylandBackend::Wayland_DataOffer_Offer( wl_data_offer *pOffer, const char *pMime )
+    {
+        m_DataOfferMimes[ pOffer ].emplace_back( pMime );
+    }
+
+    void CWaylandBackend::Wayland_DataDevice_Selection( wl_data_device *pDevice, wl_data_offer *pOffer )
+    {
+        if ( m_pSelectionOffer )
+        {
+            m_DataOfferMimes.erase( m_pSelectionOffer );
+            wl_data_offer_destroy( m_pSelectionOffer );
+        }
+        m_pSelectionOffer = pOffer;
+
+        if ( !pOffer )
+            return;
+
+        const std::vector<std::string> &mimes = m_DataOfferMimes[ pOffer ];
+        auto Has = [&]( const char *pMime ) { return std::find( mimes.begin(), mimes.end(), pMime ) != mimes.end(); };
+
+        // Our own selection echoed back from the host - the X side already has it.
+        if ( Has( "application/x-gamescope-selection" ) )
+            return;
+
+        const char *pMime = nullptr;
+        for ( const char *pCandidate : { "text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "STRING", "TEXT" } )
+        {
+            if ( Has( pCandidate ) )
+            {
+                pMime = pCandidate;
+                break;
+            }
+        }
+        if ( !pMime )
+            return;
+
+        int nFds[2];
+        if ( pipe2( nFds, O_CLOEXEC | O_NONBLOCK ) != 0 )
+        {
+            xdg_log.errorf_errno( "Failed to create clipboard pipe" );
+            return;
+        }
+
+        wl_data_offer_receive( pOffer, pMime, nFds[1] );
+        close( nFds[1] );
+        wl_display_flush( m_pDisplay );
+
+        // Never block the compositor waiting on another client - drained in PollState.
+        m_PendingClipboardReads.push_back( PendingClipboardRead{ nFds[0], {} } );
+    }
+
+    void CWaylandBackend::PollClipboardReads()
+    {
+        static constexpr size_t kMaxClipboardSize = 4 * 1024 * 1024;
+
+        for ( auto it = m_PendingClipboardReads.begin(); it != m_PendingClipboardReads.end(); )
+        {
+            char szBuf[ 4096 ];
+            ssize_t nRead;
+            while ( ( nRead = read( it->nFd, szBuf, sizeof( szBuf ) ) ) > 0 && it->szData.size() < kMaxClipboardSize )
+                it->szData.append( szBuf, nRead );
+
+            bool bWouldBlock = nRead < 0 && ( errno == EAGAIN || errno == EINTR );
+            if ( bWouldBlock && it->szData.size() < kMaxClipboardSize )
+            {
+                ++it;
+                continue;
+            }
+
+            close( it->nFd );
+            if ( nRead == 0 && !it->szData.empty() )
+                gamescope_set_selection( it->szData, GAMESCOPE_SELECTION_CLIPBOARD );
+            it = m_PendingClipboardReads.erase( it );
+        }
     }
 
     // Primary Selection Source
