@@ -2864,7 +2864,6 @@ namespace gamescope
         const std::vector<std::string> &mimes = m_DataOfferMimes[ pOffer ];
         auto Has = [&]( const char *pMime ) { return std::find( mimes.begin(), mimes.end(), pMime ) != mimes.end(); };
 
-        // Our own selection echoed back from the host - the X side already has it.
         if ( Has( "application/x-gamescope-selection" ) )
             return;
 
