@@ -807,7 +807,6 @@ namespace gamescope
         void Wayland_DataSource_Cancelled( struct wl_data_source *pSource );
         static const wl_data_source_listener s_DataSourceListener;
 
-        // Host -> nested clipboard (paste into the game)
         void Wayland_DataDevice_DataOffer( wl_data_device *pDevice, wl_data_offer *pOffer );
         void Wayland_DataDevice_Selection( wl_data_device *pDevice, wl_data_offer *pOffer );
         static const wl_data_device_listener s_DataDeviceListener;
