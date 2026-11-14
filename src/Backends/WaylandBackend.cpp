@@ -2891,7 +2891,6 @@ namespace gamescope
         close( nFds[1] );
         wl_display_flush( m_pDisplay );
 
-        // Never block the compositor waiting on another client - drained in PollState.
         m_PendingClipboardReads.push_back( PendingClipboardRead{ nFds[0], {} } );
     }
 
